@@ -44,50 +44,33 @@
 
 -include("kpro_private.hrl").
 
--define(DEFAULT_CONNECT_TIMEOUT, timer:seconds(5)).
 -define(DEFAULT_REQUEST_TIMEOUT, timer:minutes(4)).
 -define(SIZE_HEAD_BYTES, 4).
 
--type cfg_key() :: connect_timeout
-                 | client_id
-                 | extra_sock_opts
-                 | debug
+-type cfg_key() :: debug
                  | nolink
-                 | query_api_versions
                  | request_timeout
-                 | sasl
-                 | ssl.
+                 | kpro_socket:cfg_key().
 
 -type cfg_val() :: term().
 -type config() :: [{cfg_key(), cfg_val()}] | #{cfg_key() => cfg_val()}.
--type requests() :: kpro_sent_reqs:requests().
 -type hostname() :: kpro:hostname().
 -type portnum()  :: kpro:portnum().
--type client_id() :: kpro:client_id().
 -type connection() :: pid().
 
 -define(undef, undefined).
 
--record(state, { client_id   :: client_id()
-               , parent      :: pid()
-               , remote      :: kpro:endpoint()
-               , sock        :: gen_tcp:socket() | ssl:sslsocket()
-               , mod         :: ?undef | gen_tcp | ssl
+-record(state, { parent :: pid()
                , req_timeout :: ?undef | timeout()
-               , api_vsns    :: ?undef | kpro:vsn_ranges()
-               , requests    :: ?undef | requests()
+               , socket :: kpro_socket:socket()
                }).
-
--type state() :: #state{}.
 
 %%%_* API ======================================================================
 
 %% @doc Return all config keys make client config management easy.
 -spec all_cfg_keys() -> [cfg_key()].
 all_cfg_keys() ->
-  [ connect_timeout, debug, client_id, request_timeout, sasl, ssl,
-    nolink, query_api_versions, extra_sock_opts
-  ].
+  [request_timeout, debug, nolink  | kpro_socket:all_cfg_keys()].
 
 %% @doc Connect to the given endpoint.
 %% The started connection pid is linked to caller
@@ -144,8 +127,8 @@ get_api_vsns(Pid) ->
 get_endpoint(Pid) ->
   call(Pid, get_endpoint).
 
-%% @hidden
--spec get_tcp_sock(pid()) -> {ok, port()}.
+%% @hidden Test only
+-spec get_tcp_sock(pid()) -> {ok, gen_tcp:socket()}.
 get_tcp_sock(Pid) ->
   call(Pid, get_tcp_sock).
 
@@ -167,150 +150,21 @@ debug(Pid, File) when is_list(File) ->
 init(Parent, Host, Port, Config) ->
   State =
     try
-      State0 = connect(Parent, Host, Port, Config),
+      Socket = kpro_socket:connect(Host, Port, Config),
       ReqTimeout = get_request_timeout(Config),
       ok = send_assert_max_req_age(self(), ReqTimeout),
-      Requests = kpro_sent_reqs:new(),
-      State0#state{requests = Requests, req_timeout = ReqTimeout}
+      #state{ parent = Parent
+            , req_timeout = ReqTimeout
+            , socket = Socket
+            }
     catch
       error : Reason ?BIND_STACKTRACE(Stack) ->
-        ?GET_STACKTRACE(Stack),
-        IsSsl = maps:get(ssl, Config, false),
-        SaslOpt = get_sasl_opt(Config),
-        ok = maybe_log_hint(Host, Port, Reason, IsSsl, SaslOpt),
         proc_lib:init_ack(Parent, {error, {Reason, Stack}}),
         erlang:exit(normal)
     end,
-  %% From now on, enter `{active, once}' mode
-  %% NOTE: ssl doesn't support `{active, N}'
-  ok = setopts(State#state.sock, State#state.mod, [{active, once}]),
   Debug = sys:debug_options(maps:get(debug, Config, [])),
   proc_lib:init_ack(Parent, {ok, self()}),
   loop(State, Debug).
-
-%% Connect to the given endpoint, then initalize connection.
-%% Raise an error exception for any failure.
--spec connect(pid(), hostname(), portnum(), config()) -> state().
-connect(Parent, Host, Port, Config) ->
-  Timeout = get_connect_timeout(Config),
-  %% initial active opt should be 'false' before upgrading to ssl
-  SockOpts = [{active, false}, binary] ++ get_extra_sock_opts(Config),
-  case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
-    {ok, Sock} ->
-      State = #state{ client_id = get_client_id(Config)
-                    , parent    = Parent
-                    , remote    = {Host, Port}
-                    , sock      = Sock
-                    },
-      init_connection(State, Config);
-    {error, Reason} ->
-      erlang:error(Reason)
-  end.
-
-%% Initialize connection.
-%% * Upgrade to SSL
-%% * SASL authentication
-%% * Query API versions
-init_connection(#state{ client_id = ClientId
-                      , sock = Sock
-                      , remote = {Host, _}
-                      } = State, Config) ->
-  Timeout = get_connect_timeout(Config),
-  %% adjusting buffer size as per recommendation at
-  %% http://erlang.org/doc/man/inet.html#setopts-2
-  %% idea is from github.com/epgsql/epgsql
-  {ok, [{recbuf, RecBufSize}, {sndbuf, SndBufSize}]} =
-    inet:getopts(Sock, [recbuf, sndbuf]),
-  ok = inet:setopts(Sock, [{buffer, max(RecBufSize, SndBufSize)}]),
-  SslOpts = maps:get(ssl, Config, false),
-  Mod = get_tcp_mod(SslOpts),
-  NewSock = maybe_upgrade_to_ssl(Sock, Mod, SslOpts, Host, Timeout),
-  %% from now on, it's all packet-4 messages
-  ok = setopts(NewSock, Mod, [{packet, 4}]),
-  Versions =
-    case Config of
-      #{query_api_versions := false} -> ?undef;
-      _ -> query_api_versions(NewSock, Mod, ClientId, Timeout)
-    end,
-  HandshakeVsn = case Versions of
-                   #{sasl_handshake := {_, V}} -> V;
-                   _ -> 0
-                 end,
-  SaslOpts = get_sasl_opt(Config),
-  ok = kpro_sasl:auth(Host, NewSock, Mod, ClientId,
-                      Timeout, SaslOpts, HandshakeVsn),
-  State#state{mod = Mod, sock = NewSock, api_vsns = Versions}.
-
-query_api_versions(Sock, Mod, ClientId, Timeout) ->
-  Req = kpro_req_lib:make(api_versions, 0, []),
-  Rsp = kpro_lib:send_and_recv(Req, Sock, Mod, ClientId, Timeout),
-  ErrorCode = find(error_code, Rsp),
-  case ErrorCode =:= ?no_error of
-    true ->
-      Versions = find(api_versions, Rsp),
-      F = fun(V, Acc) ->
-          API = find(api_key, V),
-          MinVsn = find(min_version, V),
-          MaxVsn = find(max_version, V),
-          case is_atom(API) of
-            true ->
-              %% known API for client
-              Acc#{API => {MinVsn, MaxVsn}};
-            false ->
-              %% a broker-only (ClusterAction) API
-              Acc
-          end
-      end,
-      lists:foldl(F, #{}, Versions);
-    false ->
-      erlang:error({failed_to_query_api_versions, ErrorCode})
-  end.
-
-get_tcp_mod(_SslOpts = true)  -> ssl;
-get_tcp_mod(_SslOpts = [_|_]) -> ssl;
-get_tcp_mod(_)                -> gen_tcp.
-
-%% If SslOpts contains {verify, verify_peer}, we insert
-%% {server_name_indication, Host}. This is necessary as of OTP 20, to
-%% ensure that peer verification is done against the correct host name
-%% (otherwise the IP will be used, which is almost certainly
-%% incorrect).
-insert_server_name_indication(SslOpts, Host) ->
-  VerifyOpt = proplists:get_value(verify, SslOpts),
-  insert_server_name_indication(VerifyOpt, SslOpts, Host).
-
-insert_server_name_indication(verify_peer, SslOpts, Host) ->
-  case proplists:get_value(server_name_indication, SslOpts) of
-    undefined ->
-      %% insert {server_name_indication, Host} if not already present
-      [{server_name_indication, ensure_string(Host)} | SslOpts];
-    _ ->
-      SslOpts
-  end;
-
-insert_server_name_indication(_, SslOpts, _) ->
-  SslOpts.
-
-%% inet:hostname() is atom() | string()
-%% however sni() is only allowed to be string()
-ensure_string(Host) when is_atom(Host) -> atom_to_list(Host);
-ensure_string(Host) -> Host.
-
-maybe_upgrade_to_ssl(Sock, _Mod = ssl, SslOpts0, Host, Timeout) ->
-  SslOpts = case SslOpts0 of
-              true -> [];
-              [_|_] -> insert_server_name_indication(SslOpts0, Host)
-            end,
-
-  case ssl:connect(Sock, SslOpts, Timeout) of
-    {ok, NewSock} -> NewSock;
-    {error, Reason} -> erlang:error({failed_to_upgrade_to_ssl, Reason})
-  end;
-maybe_upgrade_to_ssl(Sock, _Mod, _SslOpts, _Host, _Timeout) ->
-  Sock.
-
-setopts(Sock, _Mod = gen_tcp, Opts) -> inet:setopts(Sock, Opts);
-setopts(Sock, _Mod = ssl, Opts)     ->  ssl:setopts(Sock, Opts).
 
 -spec wait_for_rsp(connection(), kpro:req(), timeout()) ->
         {ok, term()} | {error, any()}.
@@ -369,77 +223,45 @@ decode_msg(Msg, State, Debug0) ->
   Debug = sys:handle_debug(Debug0, fun print_msg/3, State, Msg),
   handle_msg(Msg, State, Debug).
 
-handle_msg({_, Sock, Bin}, #state{ sock     = Sock
-                                 , requests = Requests
-                                 , mod      = Mod
-                                 } = State, Debug) when is_binary(Bin) ->
-  ok = setopts(Sock, Mod, [{active, once}]),
-  {CorrId, Body} = kpro_lib:decode_corr_id(Bin),
-  {Caller, Ref, API, Vsn} = kpro_sent_reqs:get_req(Requests, CorrId),
-  Rsp = kpro_rsp_lib:decode(API, Vsn, Body, Ref),
+handle_msg({T, Sock, Bin}, #state{socket = Socket0} = State, Debug)
+ when (T =:= tcp orelse T =:= ssl) andalso is_binary(Bin) ->
+  {Socket, Caller, Rsp} = kpro_socket:handle_response(Socket0, Sock, Bin),
   ok = cast(Caller, {msg, self(), Rsp}),
-  NewRequests = kpro_sent_reqs:del(Requests, CorrId),
-  ?MODULE:loop(State#state{requests = NewRequests}, Debug);
-handle_msg(assert_max_req_age, #state{ requests = Requests
+  ?MODULE:loop(State#state{socket = Socket}, Debug);
+handle_msg(assert_max_req_age, #state{ socket = Socket
                                      , req_timeout = ReqTimeout
                                      } = State, Debug) ->
-  SockPid = self(),
+  Self = self(),
   erlang:spawn_link(fun() ->
-                        ok = assert_max_req_age(Requests, ReqTimeout),
-                        ok = send_assert_max_req_age(SockPid, ReqTimeout)
+                        ok = assert_max_req_age(Socket, ReqTimeout),
+                        ok = send_assert_max_req_age(Self, ReqTimeout)
                     end),
   ?MODULE:loop(State, Debug);
-handle_msg({tcp_closed, Sock}, #state{sock = Sock}, _) ->
+handle_msg({tcp_closed, _Sock}, _, _) ->
   exit({shutdown, tcp_closed});
-handle_msg({ssl_closed, Sock}, #state{sock = Sock}, _) ->
+handle_msg({ssl_closed, _Sock}, _, _) ->
   exit({shutdown, ssl_closed});
-handle_msg({tcp_error, Sock, Reason}, #state{sock = Sock}, _) ->
+handle_msg({tcp_error, _Sock, Reason}, _, _) ->
   exit({tcp_error, Reason});
-handle_msg({ssl_error, Sock, Reason}, #state{sock = Sock}, _) ->
+handle_msg({ssl_error, _Sock, Reason}, _, _) ->
   exit({ssl_error, Reason});
 handle_msg({From, {send, Request}},
-           #state{ client_id = ClientId
-                 , mod       = Mod
-                 , sock      = Sock
-                 , requests  = Requests
-                 } = State, Debug) ->
+           #state{socket = Socket0} = State, Debug) ->
   {Caller, _Ref} = From,
-  #kpro_req{api = API, vsn = Vsn} = Request,
-  {CorrId, NewRequests} =
-    case Request of
-      #kpro_req{no_ack = true} ->
-        kpro_sent_reqs:increment_corr_id(Requests);
-      #kpro_req{ref = Ref} ->
-        kpro_sent_reqs:add(Requests, Caller, Ref, API, Vsn)
-    end,
-  RequestIoData = kpro_req_lib:encode(ClientId, CorrId, Request),
-  Res = case Mod of
-          gen_tcp -> gen_tcp:send(Sock, RequestIoData);
-          ssl     -> ssl:send(Sock, RequestIoData)
-        end,
-  case Res of
-    ok ->
-      maybe_reply(From, ok);
-    {error, Reason0} ->
-      Reason = [ {api, API}
-               , {vsn, Vsn}
-               , {caller, Caller}
-               , {reason, Reason0}
-               ],
-      exit({send_error, Reason})
-  end,
-  ?MODULE:loop(State#state{requests = NewRequests}, Debug);
+  Socket = kpro_socket:send(Socket0, Caller, Request),
+  maybe_reply(From, ok),
+  ?MODULE:loop(State#state{socket = Socket}, Debug);
 handle_msg({From, get_api_vsns}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.api_vsns}),
+  maybe_reply(From, {ok, kpro_socket:get_api_vsns(State#state.socket)}),
   ?MODULE:loop(State, Debug);
 handle_msg({From, get_endpoint}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.remote}),
+  maybe_reply(From, {ok, kpro_socket:get_remote(State#state.socket)}),
   ?MODULE:loop(State, Debug);
 handle_msg({From, get_tcp_sock}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.sock}),
+  maybe_reply(From, {ok, kpro_socket:get_tcp_sock(State#state.socket)}),
   ?MODULE:loop(State, Debug);
-handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
-  Mod:close(Sock),
+handle_msg({From, stop}, #state{socket = Socket}, _Debug) ->
+  kpro_socket:close(Socket),
   maybe_reply(From, ok),
   ok;
 handle_msg(Msg, #state{} = State, Debug) ->
@@ -469,23 +291,21 @@ system_code_change(State, _Module, _Vsn, _Extra) ->
 format_status(Opt, Status) ->
   {Opt, Status}.
 
-print_msg(Device, {_From, {send, Request}}, State) ->
-  do_print_msg(Device, "send: ~p", [Request], State);
-print_msg(Device, {tcp, _Sock, Bin}, State) ->
-  do_print_msg(Device, "tcp: ~p", [Bin], State);
-print_msg(Device, {tcp_closed, _Sock}, State) ->
-  do_print_msg(Device, "tcp_closed", [], State);
-print_msg(Device, {tcp_error, _Sock, Reason}, State) ->
-  do_print_msg(Device, "tcp_error: ~p", [Reason], State);
-print_msg(Device, {_From, stop}, State) ->
-  do_print_msg(Device, "stop", [], State);
-print_msg(Device, Msg, State) ->
-  do_print_msg(Device, "unknown msg: ~p", [Msg], State).
+print_msg(Device, {_From, {send, Request}}, _State) ->
+  do_print_msg(Device, "send: ~p", [Request]);
+print_msg(Device, {tcp, _Sock, Bin}, _State) ->
+  do_print_msg(Device, "tcp: ~p", [Bin]);
+print_msg(Device, {tcp_closed, _Sock}, _State) ->
+  do_print_msg(Device, "tcp_closed", []);
+print_msg(Device, {tcp_error, _Sock, Reason}, _State) ->
+  do_print_msg(Device, "tcp_error: ~p", [Reason]);
+print_msg(Device, {_From, stop}, _State) ->
+  do_print_msg(Device, "stop", []);
+print_msg(Device, Msg, _State) ->
+  do_print_msg(Device, "unknown msg: ~p", [Msg]).
 
-do_print_msg(Device, Fmt, Args, State) ->
-  CorrId = kpro_sent_reqs:get_corr_id(State#state.requests),
-  io:format(Device, "[~s] ~p [~10..0b] " ++ Fmt ++ "~n",
-            [ts(), self(), CorrId] ++ Args).
+do_print_msg(Device, Fmt, Args) ->
+  io:format(Device, "[~s] ~p " ++ Fmt ++ "~n", [ts(), self() | Args]).
 
 ts() ->
   Now = os:timestamp(),
@@ -494,22 +314,14 @@ ts() ->
   lists:flatten(io_lib:format("~.4.0w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w.~w",
                               [Y, M, D, HH, MM, SS, MicroSec])).
 
--spec get_extra_sock_opts(config()) -> [gen_tcp:connect_option()].
-get_extra_sock_opts(Config) ->
-  maps:get(extra_sock_opts, Config, []).
-
--spec get_connect_timeout(config()) -> timeout().
-get_connect_timeout(Config) ->
-  maps:get(connect_timeout, Config, ?DEFAULT_CONNECT_TIMEOUT).
-
 %% Get request timeout from config.
 -spec get_request_timeout(config()) -> timeout().
 get_request_timeout(Config) ->
   maps:get(request_timeout, Config, ?DEFAULT_REQUEST_TIMEOUT).
 
--spec assert_max_req_age(requests(), timeout()) -> ok | no_return().
-assert_max_req_age(Requests, Timeout) ->
-  case kpro_sent_reqs:scan_for_max_age(Requests) of
+-spec assert_max_req_age(kpro_socket:socket(), timeout()) -> ok | no_return().
+assert_max_req_age(Socket, Timeout) ->
+  case kpro_socket:max_req_age(Socket) of
     Age when Age > Timeout ->
       erlang:exit(request_timeout);
     _ ->
@@ -526,87 +338,9 @@ send_assert_max_req_age(Pid, Timeout) when Timeout >= 1000 ->
   _ = erlang:send_after(SendAfter, Pid, assert_max_req_age),
   ok.
 
-%% So far supported endpoint is tuple {Hostname, Port}
-%% which lacks of hint on which protocol to use.
-%% It would be a bit nicer if we support endpoint formats like below:
-%%    PLAINTEX://hostname:port
-%%    SSL://hostname:port
-%%    SASL_PLAINTEXT://hostname:port
-%%    SASL_SSL://hostname:port
-%% which may give some hint for early config validation before trying to
-%% connect to the endpoint.
-%%
-%% However, even with the hint, it is still quite easy to misconfig and endup
-%% with a clueless crash report.  Here we try to make a guess on what went
-%% wrong in case there was an error during connection estabilishment.
-maybe_log_hint(Host, Port, Reason, IsSsl, SaslOpt) ->
-  case hint_msg(Reason, IsSsl, SaslOpt) of
-    ?undef ->
-      ok;
-    Msg ->
-      error_logger:error_msg("Failed to connect to ~s:~p\n~s\n",
-                             [Host, Port, Msg])
-  end.
-
-hint_msg({failed_to_upgrade_to_ssl, R}, _IsSsl, SaslOpt) when R =:= closed;
-                                                              R =:= timeout ->
-  case SaslOpt of
-    ?undef -> "Make sure connecting to a 'SSL://' listener";
-    _      -> "Make sure connecting to 'SASL_SSL://' listener"
-  end;
-hint_msg({sasl_auth_error, 'IllegalSaslState'}, true, _SaslOpt) ->
-  "Make sure connecting to 'SASL_SSL://' listener";
-hint_msg({sasl_auth_error, 'IllegalSaslState'}, false, _SaslOpt) ->
-  "Make sure connecting to 'SASL_PLAINTEXT://' listener";
-hint_msg({sasl_auth_error, {badmatch, {error, enomem}}}, false, _SaslOpts) ->
-  %% This happens when KAFKA is expecting SSL handshake
-  %% but client started SASL handshake instead
-  "Make sure 'ssl' option is in client config, \n"
-  "or make sure connecting to 'SASL_PLAINTEXT://' listener";
-hint_msg(_, _, _) ->
-  %% Sorry, I have no clue, please read the crash log
-  ?undef.
-
-%% Get sasl options from connection config.
--spec get_sasl_opt(config()) -> cfg_val().
-get_sasl_opt(Config) ->
-  case maps:get(sasl, Config, ?undef) of
-    {Mechanism, User, Pass0} when ?IS_PLAIN_OR_SCRAM(Mechanism) ->
-      Pass = case is_function(Pass0) of
-               true  -> Pass0();
-               false -> Pass0
-             end,
-      {Mechanism, User, Pass};
-    {Mechanism, File} when ?IS_PLAIN_OR_SCRAM(Mechanism) ->
-      {User, Pass} = read_sasl_file(File),
-      {Mechanism, User, Pass};
-    Other ->
-      Other
-  end.
-
-%% Read a regular file, assume it has two lines:
-%% First line is the sasl-plain username
-%% Second line is the password
--spec read_sasl_file(file:name_all()) -> {binary(), binary()}.
-read_sasl_file(File) ->
-  {ok, Bin} = file:read_file(File),
-  Lines = binary:split(Bin, <<"\n">>, [global]),
-  [User, Pass] = lists:filter(fun(Line) -> Line =/= <<>> end, Lines),
-  {User, Pass}.
-
 %% Allow binary() host name.
 host(Host) when is_binary(Host) -> binary_to_list(Host);
 host(Host) -> Host.
-
-%% Ensure binary client id
-get_client_id(Config) ->
-  ClientId = maps:get(client_id, Config, <<"kpro-client">>),
-  case is_atom(ClientId) of
-    true -> atom_to_binary(ClientId, utf8);
-    false -> ClientId
-  end.
-
-find(FieldName, Struct) -> kpro_lib:find(FieldName, Struct).
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:
