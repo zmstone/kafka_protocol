@@ -1,5 +1,10 @@
+* 2.3.7
+  - Upgrade snappyer (1.2.6) and crc32cer (0.1.8):
+    no need to link erl_interface for nif build
+    erl_interface has been deprecated in otp 22 and will be deleted in 23
+
 * 2.3.6
-   - Upgrade snappyer and crc32cer to fix build in windows
+  - Upgrade snappyer and crc32cer to fix build in windows
 
 * 2.3.5
   - Improve produce request encoding performance by 35%
