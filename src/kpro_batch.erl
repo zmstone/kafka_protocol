@@ -27,7 +27,6 @@
 -type message() :: kpro:message().
 -type ts_type() :: kpro:timestamp_type().
 -type msg_ts() :: kpro:msg_ts().
--type msg_input() :: kpro:msg_input().
 -type seqno() :: kpro:seqno().
 -type txn_ctx() :: kpro:txn_ctx().
 -type compress_option() :: kpro:compress_option().
@@ -65,46 +64,11 @@ encode(MagicVsn, Batch, Compression) ->
 %   Records => [Record]
 -spec encode_tx(batch_input(), compress_option(), seqno(), txn_ctx()) ->
         iodata().
-encode_tx([FirstMsg | _] = Batch, Compression, FirstSequence,
-          #{ producer_id := ProducerId
-           , producer_epoch := ProducerEpoch
-           }) ->
-  IsTxn = is_integer(ProducerId) andalso ProducerId >= 0,
-  FirstTimestamp =
-    case maps:get(ts, FirstMsg, false) of
-      false -> kpro_lib:now_ts();
-      Ts -> Ts
-    end,
-  EncodedBatch = encode_batch(Compression, FirstTimestamp, Batch),
-  EncodedAttributes = encode_attributes(Compression, IsTxn),
-  PartitionLeaderEpoch = -1, % producer can set whatever
-  FirstOffset = 0, % always 0
-  Magic = 2, % always 2
-  {Count, MaxTimestamp} = scan_max_ts(1, FirstTimestamp, tl(Batch)),
-  LastOffsetDelta = Count - 1, % always count - 1 for producer
-  Body0 =
-    [ EncodedAttributes           % {Attributes0,     T1} = dec(int16, T0),
-    , enc(int32, LastOffsetDelta) % {LastOffsetDelta, T2} = dec(int32, T1),
-    , enc(int64, FirstTimestamp)  % {FirstTimestamp,  T3} = dec(int64, T2),
-    , enc(int64, MaxTimestamp)    % {MaxTimestamp,    T4} = dec(int64, T3),
-    , enc(int64, ProducerId)      % {ProducerId,      T5} = dec(int64, T4),
-    , enc(int16, ProducerEpoch)   % {ProducerEpoch,   T6} = dec(int16, T5),
-    , enc(int32, FirstSequence)   % {FirstSequence,   T7} = dec(int32, T6),
-    , enc(int32, Count)           % {Count,           T8} = dec(int32, T7),
-    , EncodedBatch
-    ],
-  CRC = crc32cer:nif(Body0),
-  Body =
-    [ enc(int32, PartitionLeaderEpoch)
-    , enc(int8,  Magic)
-    , enc(int32, CRC)
-    , Body0
-    ],
-  Size = iolist_size(Body),
-  [ enc(int64, FirstOffset)
-  , enc(int32, Size)
-  | Body
-  ].
+encode_tx(Msgs, Compression, FirstSequence, Txn) ->
+  Batch = lists:foldl(fun(Msg, Acc) ->
+                          kpro_batch_encoder:append(Acc, Msg)
+                      end, kpro_batch_encoder:new(), Msgs),
+  kpro_batch_encoder:done(Batch, Compression, FirstSequence, Txn).
 
 %% @doc Decode received message-set into a batch list.
 %% Ensured by `kpro:decode_batches/1', the input binary should contain
@@ -141,28 +105,6 @@ decode(_IncompleteTail, Acc) ->
   lists:reverse(lists:map(fun({Meta, MsgsReversed}) ->
                               {Meta, lists:reverse(MsgsReversed)}
                           end, Acc)).
-
--spec scan_max_ts(pos_integer(), msg_ts(), batch_input()) ->
-        {pos_integer(), msg_ts()}.
-scan_max_ts(Count, MaxTs, []) -> {Count, MaxTs};
-scan_max_ts(Count, MaxTs0, [#{ts := Ts} | Rest]) ->
-  MaxTs = max(MaxTs0, Ts),
-  scan_max_ts(Count + 1, MaxTs, Rest);
-scan_max_ts(Count, MaxTs, [#{} | Rest]) ->
-  scan_max_ts(Count + 1, MaxTs, Rest).
-
--spec encode_batch(compress_option(), msg_ts(), [msg_input()]) -> iodata().
-encode_batch(Compression, TsBase, Batch) ->
-  Encoded0 = enc_records(_Offset = 0, TsBase, Batch),
-  Encoded = kpro_compress:compress(Compression, Encoded0),
-  Encoded.
-
--spec enc_records(offset(), msg_ts(), [msg_input()]) -> iodata().
-enc_records(_Offset, _TsBase, []) -> [];
-enc_records(Offset, TsBase, [Msg | Batch]) ->
-  [ enc_record(Offset, TsBase, Msg)
-  | enc_records(Offset + 1, TsBase, Batch)
-  ].
 
 % NOTE Return {Meta, Batch :: [message()]} where Batch is a reversed
 % RecordBatch =>
@@ -255,51 +197,6 @@ dec_record(Offset, TsFun, TsType, Bin) ->
                       },
   {Msg, T}.
 
-% Record =>
-%   Length => varint
-%   Attributes => int8
-%   TimestampDelta => varint
-%   OffsetDelta => varint
-%   KeyLen => varint
-%   Key => data
-%   ValueLen => varint
-%   Value => data
-%   Headers => [Header]
--spec enc_record(offset(), msg_ts(), msg_input()) -> iodata().
-enc_record(Offset, TsBase, #{value := Value} = M) ->
-  Ts = maps:get(ts, M, TsBase),
-  Key = maps:get(key, M, <<>>),
-  %% 'headers' is a non-nullable array
-  %% do not encode 'undefined' -> -1
-  Headers = maps:get(headers, M, []),
-  Body = [ enc(int8, 0) % no per-message attributes in magic v2
-         , enc(varint, Ts - TsBase)
-         , enc(varint, Offset)
-         , enc(bytes, Key)
-         , enc(bytes, Value)
-         , enc_headers(Headers)
-         ],
-  Size = iolist_size(Body),
-  [enc(varint, Size), Body].
-
-enc_headers(Headers) ->
-  Count = length(Headers),
-  [ enc(varint, Count)
-  | [enc_header(Header) || Header <- Headers]
-  ].
-
-% Header => HeaderKey HeaderVal
-%   HeaderKeyLen => varint
-%   HeaderKey => string
-%   HeaderValueLen => varint
-%   HeaderValue => data
-enc_header({Key, Val}) ->
-  [ enc(varint, size(Key))
-  , Key
-  , enc(varint, size(Val))
-  , Val
-  ].
-
 -spec dec_headers(binary()) -> {headers(), binary()}.
 dec_headers(Bin0) ->
   {Count, Bin} = dec(varint, Bin0),
@@ -327,16 +224,6 @@ dec(bytes, Bin) ->
 dec(Primitive, Bin) ->
   kpro_lib:decode(Primitive, Bin).
 
-enc(bytes, undefined) ->
-  enc(varint, -1);
-enc(bytes, <<>>) ->
-  enc(varint, -1);
-enc(bytes, Bin) ->
-  Len = size(Bin),
-  [enc(varint, Len), Bin];
-enc(Primitive, Val) ->
-  kpro_lib:encode(Primitive, Val).
-
 % The lowest 3 bits contain the compression codec used for the message.
 % The fourth lowest bit represents the timestamp type. 0 stands for CreateTime
 %   and 1 stands for LogAppendTime. The producer should always set this bit to 0
@@ -357,24 +244,8 @@ parse_attributes(Attr) ->
    , is_control => (Attr band (1 bsl 5)) =/= 0
    }.
 
--spec encode_attributes(compress_option(), boolean()) -> iolist().
-encode_attributes(Compression, IsTxn0) ->
-  Codec = kpro_compress:method_to_codec(Compression),
-  TsType = 0, % producer always set 0
-  IsTxn = flag(IsTxn0, 1 bsl 4),
-  IsCtrl = flag(false, 1 bsl 5),
-  Result = Codec bor TsType bor IsTxn bor IsCtrl,
-  %% yes, it's int16 for batch level attributes
-  %% message level attributes (int8) are currently unused in magic v2
-  %% and maybe get used in future magic versions
-  enc(int16, Result).
-
-flag(false, _) -> 0;
-flag(true, BitMask) -> BitMask.
-
 %%%_* Emacs ====================================================================
 %%% Local Variables:
 %%% allout-layout: t
 %%% erlang-indent-level: 2
 %%% End:
-

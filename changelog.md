@@ -1,5 +1,6 @@
 * 2.4.0
    - Split kpro_connection module to make socket implementation resuable in other processes.
+   - Split kpro_batch module to allow incremental batch collection.
 
 * 2.3.7
   - Upgrade snappyer (1.2.6) and crc32cer (0.1.8):

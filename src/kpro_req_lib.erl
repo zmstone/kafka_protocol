@@ -191,7 +191,7 @@ produce(Vsn, Topic, Partition, Batch) ->
 %%     monotonically increasing, with one sequence number per topic-partition.
 %% 3. `txn_ctx' (which is of spec `kpro:txn_ctx()') must exist in `Opts'
 -spec produce(vsn(), topic(), partition(),
-              binary() | batch_input(), produce_opts()) -> req().
+              iodata() | batch_input(), produce_opts()) -> req().
 produce(Vsn, Topic, Partition, Batch, Opts) ->
   ok = assert_known_api_and_vsn(produce, Vsn),
   RequiredAcks = required_acks(maps:get(required_acks, Opts, all_isr)),
@@ -201,17 +201,17 @@ produce(Vsn, Topic, Partition, Batch, Opts) ->
   FirstSequence = maps:get(first_sequence, Opts, -1),
   MagicV = kpro_lib:produce_api_vsn_to_magic_vsn(Vsn),
   EncodedBatch =
-    case is_binary(Batch) of
-      true ->
-        %% already encoded non-transactional batch
-        Batch;
-      false when TxnCtx =:= false ->
+    case is_list(Batch) andalso is_map(hd(Batch)) of
+      true when TxnCtx =:= false ->
         %% non-transactional batch
         kpro_batch:encode(MagicV, Batch, Compression);
-      false ->
+      true ->
         %% transactional batch
         true = FirstSequence >= 0, %% assert
-        kpro_batch:encode_tx(Batch, Compression, FirstSequence, TxnCtx)
+        kpro_batch:encode_tx(Batch, Compression, FirstSequence, TxnCtx);
+      false ->
+        %% already encoded non-transactional batch
+        Batch
     end,
   Msg =
     [ [encode(string, transactional_id(TxnCtx)) || Vsn > 2]
