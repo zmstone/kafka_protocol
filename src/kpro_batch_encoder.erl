@@ -54,8 +54,11 @@ data(#batch{data = D}) -> D.
 new() -> #batch{}.
 
 %% @doc Append one message to batch.
--spec append(batch(), msg_input()) -> batch().
-append(Batch0, Msg) ->
+-spec append(batch(), msg_input() | [msg_input()]) -> batch().
+append(Batch, []) -> Batch;
+append(Batch, [Msg | Rest]) ->
+  append(append(Batch, Msg), Rest);
+append(Batch0, Msg) when is_map(Msg) ->
   Batch = ensure_ts_base(Batch0, Msg),
   #batch{ offset = Offset
         , bytes = Bytes
@@ -100,7 +103,7 @@ done(B, Compression, FirstSequence,
     [ enc(int32, PartitionLeaderEpoch)
     , enc(int8,  Magic)
     , enc(int32, CRC)
-    , Body0
+    | Body0
     ],
   Size = iolist_size(Body),
   [ enc(int64, FirstOffset)

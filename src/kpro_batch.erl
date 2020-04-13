@@ -65,9 +65,7 @@ encode(MagicVsn, Batch, Compression) ->
 -spec encode_tx(batch_input(), compress_option(), seqno(), txn_ctx()) ->
         iodata().
 encode_tx(Msgs, Compression, FirstSequence, Txn) ->
-  Batch = lists:foldl(fun(Msg, Acc) ->
-                          kpro_batch_encoder:append(Acc, Msg)
-                      end, kpro_batch_encoder:new(), Msgs),
+  Batch = kpro_batch_encoder:append(kpro_batch_encoder:new(), Msgs),
   kpro_batch_encoder:done(Batch, Compression, FirstSequence, Txn).
 
 %% @doc Decode received message-set into a batch list.
