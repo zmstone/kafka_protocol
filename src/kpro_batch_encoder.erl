@@ -16,7 +16,7 @@
 %% This module enables batch(v2) incremental encoding.
 -module(kpro_batch_encoder).
 
--export([new/0, append/2, done/4]).
+-export([new/0, append/2, done/2, done/4]).
 -export([count/1, bytes/1, data/1]).
 -export_type([batch/0]).
 
@@ -76,11 +76,21 @@ append(Batch0, Msg) when is_map(Msg) ->
              }.
 
 %% @doc Done collecting one batch, wrap it up.
+-spec done(batch(), compress_option()) -> iodata().
+done(B, Compression) ->
+  done(B, Compression, -1, -1, -1).
+
+%% @doc Done collecting one batch, wrap it up. Supports transactional.
 -spec done(batch(), compress_option(), seqno(), txn_ctx()) -> iodata().
 done(B, Compression, FirstSequence,
      #{ producer_id := ProducerId
       , producer_epoch := ProducerEpoch
       }) ->
+  done(B, Compression, FirstSequence, ProducerId, ProducerEpoch).
+
+%%%_* Internals ================================================================
+
+done(B, Compression, FirstSequence, ProducerId, ProducerEpoch) ->
   IsTxn = is_integer(ProducerId) andalso ProducerId >= 0,
   EncodedAttributes = encode_attributes(Compression, IsTxn),
   PartitionLeaderEpoch = -1, % producer can set whatever
@@ -110,8 +120,6 @@ done(B, Compression, FirstSequence,
   , enc(int32, Size)
   | Body
   ].
-
-%%%_* Internals ================================================================
 
 %% Make sure ts_base is initialized when the first message is appended.
 ensure_ts_base(#batch{offset = 0} = Batch, Msg) ->
