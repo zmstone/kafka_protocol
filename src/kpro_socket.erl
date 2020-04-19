@@ -61,7 +61,7 @@
                 , requests    :: ?undef | requests()
                 }).
 
--type socket() :: #socket{}.
+-opaque socket() :: #socket{}.
 
 %% @doc Return all config keys make client config management easy.
 -spec all_cfg_keys() -> [cfg_key()].
@@ -144,8 +144,8 @@ close(#socket{sock = Sock, mod = Mod}) ->
   Mod:close(Sock).
 
 %% @doc Get api versions.
--spec get_api_vsns(socket()) -> ?undef | kpro:vsn_ranges().
-get_api_vsns(#socket{api_vsns = Vsns}) -> Vsns.
+-spec get_api_vsns(socket()) -> {ok, ?undef | kpro:vsn_ranges()}.
+get_api_vsns(#socket{api_vsns = Vsns}) -> {ok, Vsns}.
 
 %% @doc Get the endpoint it is connected to.
 -spec get_remote(socket()) -> kpro:endpoint().
@@ -162,7 +162,7 @@ do_connect(Host, Port, Config) ->
   Timeout = get_connect_timeout(Config),
   %% initial active opt should be 'false' before upgrading to ssl
   SockOpts = [{active, false}, binary] ++ get_extra_sock_opts(Config),
-  case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
+  case gen_tcp:connect(host(Host), Port, SockOpts, Timeout) of
     {ok, Sock} ->
       Socket = #socket{ client_id = get_client_id(Config)
                       , remote    = {Host, Port}
@@ -363,6 +363,10 @@ read_sasl_file(File) ->
   {User, Pass}.
 
 find(FieldName, Struct) -> kpro_lib:find(FieldName, Struct).
+
+%% Allow binary() host name.
+host(Host) when is_binary(Host) -> binary_to_list(Host);
+host(Host) -> Host.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

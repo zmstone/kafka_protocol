@@ -33,6 +33,7 @@
 -type partition() :: kpro:partition().
 -type config() :: kpro_connection:config().
 -type connection() :: kpro:connection().
+-type socket() :: kpro:socket().
 -type coordinator_type() :: kpro:coordinator_type().
 -type group_id() :: kpro:group_id().
 -type transactional_id() :: kpro:transactional_id().
@@ -110,10 +111,14 @@ connect_controller(Bootstrap, Config, Opts) ->
 %% @doc Qury API version ranges using the given `kpro_connection' pid.
 %% The return value is an intersection of queried version ranges
 %% and version ranges supported in THIS library.
--spec get_api_versions(connection()) ->
+-spec get_api_versions(connection() | socket()) ->
         {ok, kpro:vsn_ranges()} | {error, any()}.
 get_api_versions(Connection) ->
-  case kpro_connection:get_api_vsns(Connection) of
+  Mod = case is_pid(Connection) of
+          true  -> kpro_connection;
+          false -> kpro_socket
+        end,
+  case Mod:get_api_vsns(Connection) of
     {ok, Vsns}      -> {ok, api_vsn_range_intersection(Vsns)};
     {error, Reason} -> {error, Reason}
   end.

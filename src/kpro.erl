@@ -26,6 +26,11 @@
         , connect_partition_leader/5
         ]).
 
+%% Socket
+-export([ close_socket/1
+        , connect_socket/2
+        ]).
+
 %% Broker properties
 -export([ discover_coordinator/4
         , discover_partition_leader/4
@@ -119,6 +124,7 @@
              , rsp/0
              , schema/0
              , seqno/0
+             , socket/0
              , stack/0
              , str/0
              , struct/0
@@ -215,6 +221,7 @@
 -type stack() :: [{api(), vsn()} | field_name()]. %% encode / decode stack
 -type isolation_level() :: read_committed | read_uncommitted.
 -type connection() :: kpro_connection:connection().
+-type socket() :: kpro_socket:socket().
 -type conn_config() :: kpro_connection:config().
 -type vsn_range() :: {vsn(), vsn()}.
 -type vsn_ranges() :: #{api() => vsn_range()}.
@@ -331,6 +338,17 @@ request_async(ConnectionPid, Request) ->
 send(ConnectionPid, Request) when is_pid(ConnectionPid) ->
   kpro_connection:send(ConnectionPid, Request).
 
+%% @doc Connect and return a new `kpro:socket()'. NOTE not a `kpro:connect()'.
+%% It raises an `error' exception in case of any error.
+-spec connect_socket(endpoint(), conn_config()) -> socket().
+connect_socket({Host, Port}, ConnConfig) ->
+  kpro_socket:connect(Host, Port, ConnConfig).
+
+%% @doc Close socket.
+-spec close_socket(socket()) -> ok | {error, any()}.
+close_socket(Socket) ->
+  kpro_socket:close(Socket).
+
 %% @doc Connect to the given endpoint.
 %% NOTE: Connection process is linked to caller unless `nolink => true'
 %%       is set in connection config
@@ -420,8 +438,8 @@ connect_coordinator(Bootstrap, ConnConfig, Args) ->
 discover_coordinator(Connection, Type, Id, Timeout) ->
   kpro_brokers:discover_coordinator(Connection, Type, Id, Timeout).
 
-%% @doc Qury API versions using the given `kpro_connection' pid.
--spec get_api_versions(connection()) ->
+%% @doc Qury API versions on the connected connection or socket.
+-spec get_api_versions(connection() | socket()) ->
         {ok, vsn_ranges()} | {error, any()}.
 get_api_versions(Connection) ->
   kpro_brokers:get_api_versions(Connection).

@@ -79,9 +79,9 @@ all_cfg_keys() ->
 start(Host, Port, Config) when is_list(Config) ->
   start(Host, Port, maps:from_list(Config));
 start(Host, Port, #{nolink := true} = Config) ->
-  proc_lib:start(?MODULE, init, [self(), host(Host), Port, Config]);
+  proc_lib:start(?MODULE, init, [self(), Host, Port, Config]);
 start(Host, Port, Config) ->
-  proc_lib:start_link(?MODULE, init, [self(), host(Host), Port, Config]).
+  proc_lib:start_link(?MODULE, init, [self(), Host, Port, Config]).
 
 %% @doc Same as @link request_async/2.
 %% Only that the message towards connection process is a cast (not a call).
@@ -252,7 +252,7 @@ handle_msg({From, {send, Request}},
   maybe_reply(From, ok),
   ?MODULE:loop(State#state{socket = Socket}, Debug);
 handle_msg({From, get_api_vsns}, State, Debug) ->
-  maybe_reply(From, {ok, kpro_socket:get_api_vsns(State#state.socket)}),
+  maybe_reply(From, kpro_socket:get_api_vsns(State#state.socket)),
   ?MODULE:loop(State, Debug);
 handle_msg({From, get_endpoint}, State, Debug) ->
   maybe_reply(From, {ok, kpro_socket:get_remote(State#state.socket)}),
@@ -337,10 +337,6 @@ send_assert_max_req_age(Pid, Timeout) when Timeout >= 1000 ->
   SendAfter = erlang:min(Timeout div 2, timer:minutes(1)),
   _ = erlang:send_after(SendAfter, Pid, assert_max_req_age),
   ok.
-
-%% Allow binary() host name.
-host(Host) when is_binary(Host) -> binary_to_list(Host);
-host(Host) -> Host.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:
