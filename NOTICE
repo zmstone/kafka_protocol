@@ -3,3 +3,7 @@ Copyright 2014-2018 Klarna AB
 
 This product includes software developed by
 Klarna AB (https://www.klarna.com)
+
+=== EXTENDED NOTICE 202102 =====================================================
+
+This lib is forked from original repo https://github.com/klarna/kafka_protocol

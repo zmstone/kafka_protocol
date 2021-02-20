@@ -1,3 +1,9 @@
+* 4.0.0
+  - Remove hard dependency to snappyer and lz4b
+    Most of the users do not require snappy and lz4 compression
+    having forced to download and compile the nif libs often become
+    troublesome on certain platforms.
+    Since 4.0, a compression API should be provided by user
 * 3.0.1
   - remove old rebar from app.src
 * 3.0.0
