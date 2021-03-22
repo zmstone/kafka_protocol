@@ -59,16 +59,26 @@ produce_api_vsn_to_magic_vsn(V) ->
 %% @doc Send a raw packet to broker and wait for response raw packet.
 -spec send_and_recv_raw(iodata(), port(), module(), timeout()) -> binary().
 send_and_recv_raw(Req, Sock, Mod, Timeout) ->
-  Opts = [{active, false}],
+  Opts = [{active, once}, {packet,0}],
   case Mod of
     gen_tcp -> ok = inet:setopts(Sock, Opts);
     ssl -> ok = ssl:setopts(Sock, Opts)
   end,
   ok = Mod:send(Sock, Req),
-  case Mod:recv(Sock, _Len = 0, Timeout) of
-    {ok, Rsp} -> Rsp;
-    {error, Reason} -> erlang:error(Reason)
+  io:format(user, "sent-bytes ~p\n~0p\n", [iolist_size(Req), iolist_to_binary(Req)]),
+  receive
+      {_, S, Rsp} ->
+          Sock = S,
+          io:format(user, "~p\n", [Rsp]),
+          Rsp
+  after
+      Timeout ->
+          erlang:error(timeout)
   end.
+  % case Mod:recv(Sock, _Len = 0, Timeout) of
+  %   {ok, Rsp} -> Rsp;
+  %   {error, Reason} -> erlang:error(Reason)
+  % end.
 
 %% @doc Send request to active = false socket, and wait for response.
 -spec send_and_recv(kpro:req(), port(), module(),
